@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import logging
+import threading
 import requests
 import schedule
 from datetime import datetime, timezone
@@ -19,8 +20,8 @@ OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY", "").strip()
 OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "").strip()
 OKX_SIMULATED = os.getenv("OKX_SIMULATED", "true").lower() == "true"
 
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip().strip('"').strip("'")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip().strip('"').strip("'")
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 
 # 🎯 資金分配核心 (動態彈性)
 TRADE_EQUITY_PCT = float(os.getenv("TRADE_EQUITY_PCT", "8.0"))
@@ -37,19 +38,13 @@ CT_VAL_CACHE = {}
 
 def send_tg_msg(message: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        logging.warning(f"⚠️ [TG 未發送] 變數為空: TOKEN長度={len(TG_BOT_TOKEN)}, CHAT_ID={TG_CHAT_ID}")
         return
     try:
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}
-        res = requests.post(url, json=payload, timeout=8)
-        res_data = res.json()
-        if res_data.get("ok"):
-            logging.info("✅ Telegram 消息發送成功！")
-        else:
-            logging.error(f"❌ Telegram 拒絕發送: {res_data.get('description')} (請檢查 Chat ID 或是否向機器人點過 /start)")
+        requests.post(url, json=payload, timeout=8)
     except Exception as e:
-        logging.error(f"❌ 發送 TG 異常: {e}")
+        logging.error(f"發送 TG 失敗: {e}")
 
 def okx_signature(timestamp: str, method: str, request_path: str, body: str = ""):
     message = timestamp + method.upper() + request_path + body
@@ -82,12 +77,18 @@ def okx_request(method: str, path: str, body_dict: dict = None):
         logging.error(f"OKX API 異常 ({path}): {e}")
         return None
 
-def get_account_equity():
+def get_account_balance():
     res = okx_request("GET", "/api/v5/account/balance")
-    if res and res.get("code") == "0":
-        data = res.get("data", [{}])[0]
-        return float(data.get("totalEq", "1000.0"))
-    return 1000.0
+    if res and res.get("code") == "0" and res.get("data"):
+        data = res["data"][0]
+        total_eq = float(data.get("totalEq", "0.0"))
+        avail_bal = 0.0
+        for detail in data.get("details", []):
+            if detail.get("ccy") == "USDT":
+                avail_bal = float(detail.get("availBal", "0.0"))
+                break
+        return total_eq, avail_bal
+    return 1000.0, 1000.0
 
 def calculate_dynamic_margin(equity: float):
     calc = equity * (TRADE_EQUITY_PCT / 100.0)
@@ -107,7 +108,6 @@ def get_contract_val(inst_id: str):
     return 1.0
 
 def scan_best_coins():
-    logging.info("🔍 掃描全市場永續合約 (篩選成交量 > 500 萬 U & 強勢突破標的)...")
     try:
         url = f"{OKX_HOST}/api/v5/market/tickers?instType=SWAP"
         res = requests.get(url, timeout=10).json()
@@ -139,7 +139,6 @@ def scan_best_coins():
         candidates.sort(key=lambda x: abs(x["change24h"]), reverse=True)
         return candidates[:15]
     except Exception as e:
-        logging.error(f"選幣錯誤: {e}")
         return []
 
 def calculate_ema(prices, period):
@@ -172,7 +171,7 @@ def check_trade_signal(inst_id: str):
         elif ema_fast < ema_slow and current_price < bb_basis:
             return "SHORT"
         return None
-    except Exception as e:
+    except Exception:
         return None
 
 def get_current_positions():
@@ -199,7 +198,6 @@ def open_okx_position(inst_id: str, direction: str, price: float, dynamic_margin
         "sz": str(sz)
     }
 
-    logging.info(f"🚀 送出 OKX 開倉: {inst_id} {direction} {sz} 張 (本金: {dynamic_margin} U)...")
     res = okx_request("POST", "/api/v5/trade/order", payload)
     if res and res.get("code") == "0":
         order_data = res.get("data", [{}])[0]
@@ -215,8 +213,6 @@ def open_okx_position(inst_id: str, direction: str, price: float, dynamic_margin
             )
             send_tg_msg(msg)
             return True
-        else:
-            logging.error(f"下單拒絕: {order_data.get('sMsg')}")
     return False
 
 def close_okx_position(pos: dict, reason: str):
@@ -227,30 +223,112 @@ def close_okx_position(pos: dict, reason: str):
         "mgnMode": "cross",
         "posSide": pos_side
     }
-    logging.info(f"🛑 觸發平倉: {inst_id} 原因: {reason}")
     res = okx_request("POST", "/api/v5/trade/close-position", payload)
     if res and res.get("code") == "0":
         pnl = pos.get("upl", "0")
         msg = f"🔔 <b>【自動平倉結算】</b>\n標的: <code>{inst_id}</code>\n原因: <b>{reason}</b>\n平倉損益: <b>{pnl} USDT</b>"
         send_tg_msg(msg)
 
+def close_all_positions():
+    positions = get_current_positions()
+    if not positions:
+        send_tg_msg("⚠️ 目前沒有任何持倉部位需要平倉。")
+        return
+    for pos in positions:
+        close_okx_position(pos, "手動全平指令觸發")
+    send_tg_msg(f"✅ 已執行全部平倉操作，共結算 {len(positions)} 筆部位。")
+
+# ==========================================
+# 💬 Telegram 雙向互動指令監聽器
+# ==========================================
+def handle_tg_command(text: str):
+    cmd = text.strip().lower()
+
+    if cmd in ["帳戶", "账户", "資產", "资产", "/account", "/balance"]:
+        total_eq, avail_bal = get_account_balance()
+        positions = get_current_positions()
+        
+        pos_text = ""
+        if positions:
+            for p in positions:
+                symbol = p.get("instId", "").replace("-USDT-SWAP", "")
+                side = "做多 🟢" if p.get("posSide") == "long" else "做空 🔴"
+                upl = float(p.get("upl", "0"))
+                ratio = float(p.get("uplRatio", "0")) * 100
+                pos_text += f"\n• <b>{symbol}</b> ({side})\n  未實現損益: <code>{'+' if upl>=0 else ''}{upl:.2f} U ({ratio:+.2f}%)</code>"
+        else:
+            pos_text = "\n• 目前無運行中持倉部位"
+
+        msg = (
+            f"🏦 <b>【OKX 即時帳戶總覽】</b>\n"
+            f"💰 帳戶總淨值: <b>{total_eq:,.2f} USD</b>\n"
+            f"💵 可用保證金: <b>{avail_bal:,.2f} USDT</b>\n"
+            f"🎯 模式: {'模擬盤 (Demo)' if OKX_SIMULATED else '實盤 (Live)'}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"📈 <b>當前持倉 ({len(positions)} 筆):</b>{pos_text}"
+        )
+        send_tg_msg(msg)
+
+    elif cmd in ["選幣", "选币", "推薦", "/scan"]:
+        candidates = scan_best_coins()
+        if not candidates:
+            send_tg_msg("暫無符合強動量的熱門候選標的。")
+            return
+        list_str = "\n".join([f"• <b>{c['symbol']}</b>: 現價 {c['price']} | 24H: {c['change24h']:+.2f}%" for c in candidates[:8]])
+        send_tg_msg(f"🎯 <b>【當前全市場量化熱門掃描榜】</b>\n━━━━━━━━━━━━━━━\n{list_str}")
+
+    elif cmd in ["全平", "/closeall"]:
+        close_all_positions()
+
+    elif cmd in ["日報", "日报", "/report"]:
+        send_daily_report()
+
+    elif cmd in ["說明", "帮助", "help", "/help", "/start"]:
+        help_msg = (
+            "🤖 <b>【冰火菠蘿 OKX 智能指令導覽】</b>\n\n"
+            "您可以直接在群組或私聊中輸入以下文字：\n\n"
+            "• <b>帳戶</b> - 即時查看總資產、保證金與當前持倉部位\n"
+            "• <b>選幣</b> - 查看目前 24H 動量最強的掃描榜單\n"
+            "• <b>日報</b> - 立即生成並發送量化損益綜合日報\n"
+            "• <b>全平</b> - 緊急平倉當前所有已持有的合約\n"
+            "• <b>說明</b> - 顯示此功能指令導覽"
+        )
+        send_tg_msg(help_msg)
+
+def tg_polling_loop():
+    """背景執行緒：即時監聽 Telegram 訊息"""
+    last_update_id = 0
+    logging.info("💬 Telegram 雙向對話監聽器已啟動...")
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getUpdates?offset={last_update_id + 1}&timeout=20"
+            res = requests.get(url, timeout=25).json()
+            if res.get("ok"):
+                for update in res.get("result", []):
+                    last_update_id = update.get("update_id", last_update_id)
+                    msg_obj = update.get("message") or update.get("channel_post")
+                    if msg_obj and "text" in msg_obj:
+                        text = msg_obj["text"]
+                        handle_tg_command(text)
+        except Exception:
+            pass
+        time.sleep(2)
+
+# ==========================================
+# 4. 主巡邏與日報排程
+# ==========================================
 def main_trading_cycle():
-    logging.info("--- 🔄 執行全市場掃描與風控檢測 ---")
-    
     positions = get_current_positions()
     for pos in positions:
         upl_ratio = float(pos.get("uplRatio", "0")) * 100.0
-        inst_id = pos.get("instId")
         if upl_ratio >= TAKE_PROFIT_PCT:
             close_okx_position(pos, f"達成目標止盈 (+{upl_ratio:.2f}%)")
         elif upl_ratio <= -STOP_LOSS_PCT:
             close_okx_position(pos, f"觸發強制止損 ({upl_ratio:.2f}%)")
 
     if len(positions) < MAX_POSITIONS:
-        equity = get_account_equity()
-        dynamic_margin = calculate_dynamic_margin(equity)
-        logging.info(f"當前帳戶淨值: {equity:.2f} USD，計算動態開倉本金: {dynamic_margin} USDT")
-
+        total_eq, _ = get_account_balance()
+        dynamic_margin = calculate_dynamic_margin(total_eq)
         candidates = scan_best_coins()
         for cand in candidates:
             if len(positions) >= MAX_POSITIONS:
@@ -258,7 +336,6 @@ def main_trading_cycle():
             inst_id = cand["instId"]
             if any(p.get("instId") == inst_id for p in positions):
                 continue
-
             signal = check_trade_signal(inst_id)
             if signal:
                 opened = open_okx_position(inst_id, signal, cand["price"], dynamic_margin)
@@ -267,23 +344,26 @@ def main_trading_cycle():
                 time.sleep(1)
 
 def send_daily_report():
-    equity = get_account_equity()
+    total_eq, avail_bal = get_account_balance()
     positions = get_current_positions()
     report = (
-        f"📊 <b>【OKX 雲端量化機器人 - 定時資產日報】</b>\n"
+        f"📊 <b>【OKX 雲端量化機器人 - 定時日報】</b>\n"
         f"⏰ 時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"💰 帳戶總淨值: <b>{equity:,.2f} USD</b>\n"
+        f"💰 帳戶總資產: <b>{total_eq:,.2f} USD</b>\n"
+        f"💵 可用保證金: <b>{avail_bal:,.2f} USDT</b>\n"
         f"📈 當前持倉部位: <b>{len(positions)}</b> 筆\n"
-        f"🎯 動態單筆規模: <b>{calculate_dynamic_margin(equity)} USDT</b> ({TRADE_EQUITY_PCT}%)\n"
+        f"🎯 動態單筆規模: <b>{calculate_dynamic_margin(total_eq)} USDT</b> ({TRADE_EQUITY_PCT}%)\n"
         f"🤖 運行模式: {'模擬盤 (Demo)' if OKX_SIMULATED else '實盤 (Live)'}\n"
     )
     send_tg_msg(report)
 
 if __name__ == "__main__":
-    # 診斷 Telegram 設定
-    logging.info(f"啟動檢查: TG_BOT_TOKEN 長度={len(TG_BOT_TOKEN)}, TG_CHAT_ID={TG_CHAT_ID}")
-    send_tg_msg("🚀 <b>OKX 24H 雲端量化機器人【全自動選幣 + 動態彈性倉位版】已啟動上線！</b>")
+    send_tg_msg("🚀 <b>OKX 24H 雲端量化機器人【全功能互動版】已啟動！輸入「說明」或「帳戶」可直接互動！</b>")
     
+    # 啟動 Telegram 雙向指令監聽背景執行緒
+    t = threading.Thread(target=tg_polling_loop, daemon=True)
+    t.start()
+
     schedule.every(2).minutes.do(main_trading_cycle)
     schedule.every().day.at("08:00").do(send_daily_report)
     schedule.every().day.at("20:00").do(send_daily_report)
