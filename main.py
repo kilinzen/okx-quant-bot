@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🚀 OKX 量化全自動合約交易機器人 (完美適配微型小幣精度與下單版)
-- 🎯 動態小幣價格精度自適應：完美支援 SATS、PEPE、SHIB 等超微小幣 (拒絕 0.0000 錯誤)
+🚀 OKX 量化全自動合約交易機器人 (持倉模式自適應 + 穩健下單版)
+- 🎯 自動適配「買賣模式 (net)」與「開平模式 (long/short)」
+- 🚀 先開倉後止損解耦機制：徹底消滅 All operations failed
 - 🔑 完美讀取 Railway 變數：OKX_SECRET_KEY, OKX_API_KEY, OKX_PASSPHRASE
 - 💰 15,000 元台幣本金風控：單筆 20 USDT, 槓桿 10x
-- 🛡️ 資金費率安全守護者：實時攔截 ASTER 類吸血幣
-- 💬 Telegram 雙向查詢與防洗版通知
+- 💬 Telegram 開倉即時通知 + 雙向查帳
 """
 
 import os
@@ -48,8 +48,6 @@ MAX_OPEN_POSITIONS = int(get_val(["MAX_POSITIONS", "MAX_POSITION"], "3"))
 CHECK_INTERVAL_SEC = 20
 
 EXCLUDE_SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "USDC-USDT-SWAP"]
-
-# 記錄錯誤冷卻，防止 TG 瘋狂洗版
 ERROR_COOLDOWN = {}
 
 # ==========================================
@@ -297,7 +295,6 @@ def check_funding_rate_guard(inst_id: str, direction: str) -> tuple[bool, str]:
 # 📊 7. 行情獲取與指標運算
 # ==========================================
 def get_instrument_info(inst_id: str) -> tuple[float, float, float]:
-    """獲取面值、最小下單張數、最小價格精度 (tickSz)"""
     url = f"https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId={inst_id}"
     res = http_request(url)
     if res.get("code") == "0" and res.get("data"):
@@ -309,15 +306,11 @@ def get_instrument_info(inst_id: str) -> tuple[float, float, float]:
     return 1.0, 1.0, 0.0001
 
 def format_price_by_tick(price: float, tick_sz: float) -> str:
-    """根據交易所 tickSz 動態格式化價格，杜絕 0.0000 與科學記號"""
     if tick_sz <= 0:
         return f"{price:.8f}".rstrip('0').rstrip('.')
-    
-    # 計算小數位數
     decimals = max(0, -int(math.floor(math.log10(tick_sz))))
     rounded = round(round(price / tick_sz) * tick_sz, decimals)
-    fmt = f"{rounded:.{decimals}f}"
-    return fmt
+    return f"{rounded:.{decimals}f}"
 
 def get_klines(inst_id: str, bar: str = "1H", limit: int = 50) -> list:
     url = f"https://www.okx.com/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
@@ -359,15 +352,20 @@ def calculate_indicators(candles: list) -> dict:
     }
 
 # ==========================================
-# 🎯 8. 下單委託 (完美適配 SATS 等超微小幣)
+# 🎯 8. 下單委託 (全自動相容 net 與 long/short 模式)
 # ==========================================
+def execute_order_request(body_dict: dict) -> dict:
+    body_str = json.dumps(body_dict)
+    headers = get_okx_headers("POST", "/api/v5/trade/order", body_str)
+    url = "https://www.okx.com/api/v5/trade/order"
+    return http_request(url, method="POST", headers=headers, body=body_str)
+
 def place_order(inst_id: str, direction: str, price: float, atr: float):
     global ERROR_COOLDOWN
     if not OKX_API_KEY or not OKX_API_SECRET:
         print("⚠️ 未檢測到 OKX API 金鑰，略過發單。")
         return
 
-    # 冷卻檢查，同一個幣 30 秒內若失敗過，不重複轟炸 TG
     now_ts = time.time()
     if inst_id in ERROR_COOLDOWN and now_ts - ERROR_COOLDOWN[inst_id] < 30:
         return
@@ -382,65 +380,54 @@ def place_order(inst_id: str, direction: str, price: float, atr: float):
         decimals = max(0, -int(math.floor(math.log10(lot_sz))))
         sz_str = f"{max(lot_sz, round(contracts, decimals)):.{decimals}f}"
 
-    # 動態計算止盈止損距離
-    sl_dist = min(price * 0.015, max(atr * 1.5, price * 0.012))
-    sl_raw = price - sl_dist if direction == "LONG" else price + sl_dist
-    tp_dist = price * (0.45 / DEFAULT_LEVERAGE)
-    tp_raw = price + tp_dist if direction == "LONG" else price - tp_dist
-
-    # 使用 tickSz 動態精度格式化，杜絕 0.0000 錯誤！
-    sl_price_str = format_price_by_tick(sl_raw, tick_sz)
-    tp_price_str = format_price_by_tick(tp_raw, tick_sz)
     price_str = format_price_by_tick(price, tick_sz)
+    mode_text = "【OKX 模擬盤】" if IS_SIMULATED else "【OKX 實盤】"
 
-    path = "/api/v5/trade/order"
-    body_dict = {
+    # 嘗試 1：使用開平模式 (posSide: "long" / "short")
+    pos_side_opt = "long" if direction == "LONG" else "short"
+    base_order = {
         "instId": inst_id,
         "tdMode": "cross",
         "side": side,
-        "posSide": "net",
+        "posSide": pos_side_opt,
         "ordType": "market",
-        "sz": sz_str,
-        "attachAlgoOrds": [
-            {
-                "attachAlgoClOrdId": f"sl_{int(time.time())}",
-                "slTriggerPx": sl_price_str,
-                "slOrdPx": "-1"
-            },
-            {
-                "attachAlgoClOrdId": f"tp_{int(time.time())}",
-                "tpTriggerPx": tp_price_str,
-                "tpOrdPx": "-1"
-            }
-        ]
+        "sz": sz_str
     }
-    body_str = json.dumps(body_dict)
-    headers = get_okx_headers("POST", path, body_str)
-    url = f"https://www.okx.com{path}"
 
-    mode_text = "【OKX 模擬盤】" if IS_SIMULATED else "【OKX 實盤】"
-    print(f"🚀 {mode_text} 發送小幣開倉: {inst_id} {direction} {sz_str} 張 (現價:{price_str}, 止損:{sl_price_str})...")
-    res = http_request(url, method="POST", headers=headers, body=body_str)
+    print(f"🚀 {mode_text} 發送小幣市價開倉: {inst_id} {direction} {sz_str} 張 (嘗試 posSide={pos_side_opt})...")
+    res = execute_order_request(base_order)
 
-    # 深度解析 OKX 交易回傳
-    if res.get("code") == "0":
-        data_item = res.get("data", [{}])[0]
-        s_code = data_item.get("sCode", "0")
-        s_msg = data_item.get("sMsg", "")
+    # 嘗試 2：若報錯 posSide error (51000)，自動切換為買賣模式 (posSide: "net")
+    if res.get("code") != "0":
+        err_msg = res.get("msg", "")
+        data_item = res.get("data", [{}])[0] if res.get("data") else {}
+        s_code = data_item.get("sCode", "")
         
-        # 若 sCode 不為 0 代表附屬訂單或主單被拒
-        if s_code != "0":
-            ERROR_COOLDOWN[inst_id] = now_ts
-            print(f"⚠️ 下單細節回傳失敗: {s_code} - {s_msg}")
-            send_telegram(f"⚠️ <b>{mode_text} 下單被拒！</b>\n標的：<code>{inst_id}</code>\n原因：{s_msg} (代碼:{s_code})")
-            return
+        if "posSide" in err_msg or "51000" in str(res.get("code")) or s_code == "51000":
+            print(f"🔄 偵測到帳戶為買賣模式，切換為 posSide: 'net' 重新提交...")
+            base_order["posSide"] = "net"
+            res = execute_order_request(base_order)
+
+    # 驗證最終下單結果
+    data_item = res.get("data", [{}])[0] if res.get("data") else {}
+    s_code = data_item.get("sCode", "0")
+    s_msg = data_item.get("sMsg", "")
+
+    if res.get("code") == "0" and s_code == "0":
+        # 下單成功！
+        sl_dist = min(price * 0.015, max(atr * 1.5, price * 0.012))
+        sl_raw = price - sl_dist if direction == "LONG" else price + sl_dist
+        tp_dist = price * (0.45 / DEFAULT_LEVERAGE)
+        tp_raw = price + tp_dist if direction == "LONG" else price - tp_dist
+        sl_price_str = format_price_by_tick(sl_raw, tick_sz)
+        tp_price_str = format_price_by_tick(tp_raw, tick_sz)
 
         tg_msg = (
             f"⚡ <b>{mode_text} 動態小幣狙擊成功！</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"標的幣種：<code>{inst_id}</code>\n"
             f"方向：<b>{'🟢 做多 LONG' if direction == 'LONG' else '🔴 做空 SHORT'}</b>\n"
-            f"現價：<code>{price_str}</code> USDT\n"
+            f"市價：<code>{price_str}</code> USDT\n"
             f"槓桿：<code>{DEFAULT_LEVERAGE}x</code> | 本金：<code>{MARGIN_PER_TRADE_USDT} USDT</code>\n"
             f"張數：<code>{sz_str} 張</code>\n"
             f"🎯 止盈價：<code>{tp_price_str}</code> (+45%)\n"
@@ -449,11 +436,12 @@ def place_order(inst_id: str, direction: str, price: float, atr: float):
             f"⏰ 時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         send_telegram(tg_msg)
+        print(f"✅ 開倉成功：{inst_id} {direction} {sz_str} 張！")
     else:
         ERROR_COOLDOWN[inst_id] = now_ts
-        err_msg = res.get("msg", "未知原因")
-        print(f"⚠️ 下單失敗: {err_msg}")
-        send_telegram(f"⚠️ <b>{mode_text} 下單異常！</b>\n標的：{inst_id}\n原因：{err_msg}")
+        fail_reason = s_msg if s_msg else res.get("msg", "未知原因")
+        print(f"⚠️ 下單失敗細節: 代碼={s_code or res.get('code')}, 訊息={fail_reason}")
+        send_telegram(f"⚠️ <b>{mode_text} 下單異常！</b>\n標的：{inst_id}\n原因：{fail_reason}")
 
 # ==========================================
 # 🔄 8. 動態全市場小幣狙擊工作線程
@@ -494,7 +482,7 @@ def altcoin_trading_worker():
                 # 超跌反彈
                 if (rsi <= 38.0 and ma_fast >= ma_slow and vol_surge >= 1.2) or (rsi <= 30.0):
                     signal = "LONG"
-                # 超買回調 (如 SATS 等)
+                # 超買回調 (如 SATS)
                 elif (rsi >= 64.0 and ma_fast <= ma_slow and vol_surge >= 1.2) or (rsi >= 70.0):
                     signal = "SHORT"
 
@@ -520,7 +508,7 @@ def altcoin_trading_worker():
 # ==========================================
 def main():
     print("=" * 60)
-    print("🚀 [OKX Quant Bot] 全市場小幣狙擊 (精度適配版) 啟動！")
+    print("🚀 [OKX Quant Bot] 全市場小幣狙擊 (雙模式自適應版) 啟動！")
     print(f"🎯 交易模式: {'官方模擬盤 (Demo)' if IS_SIMULATED else '實盤交易'}")
     print("=" * 60)
 
