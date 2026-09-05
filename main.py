@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🚀 OKX 量化全自動合約交易機器人 (精確對齊 Railway 變數名稱版)
-- 🔑 完美讀取：OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE, OKX_SIMULATED
+🚀 OKX 量化全自動合約交易機器人 (完美適配微型小幣精度與下單版)
+- 🎯 動態小幣價格精度自適應：完美支援 SATS、PEPE、SHIB 等超微小幣 (拒絕 0.0000 錯誤)
+- 🔑 完美讀取 Railway 變數：OKX_SECRET_KEY, OKX_API_KEY, OKX_PASSPHRASE
 - 💰 15,000 元台幣本金風控：單筆 20 USDT, 槓桿 10x
-- 🎯 全市場動態小幣狙擊：排除大幣，專注暴動小幣
-- 💬 Telegram 雙向查詢：輸入「帳戶」即時查帳
 - 🛡️ 資金費率安全守護者：實時攔截 ASTER 類吸血幣
-- 🔒 24H 永不退出守護
+- 💬 Telegram 雙向查詢與防洗版通知
 """
 
 import os
@@ -23,7 +22,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ==========================================
-# ⚙️ 1. 系統與環境變數設定 (精準對齊您的截圖)
+# ⚙️ 1. 系統與環境變數設定
 # ==========================================
 def get_val(keys: list, default: str = "") -> str:
     for k in keys:
@@ -32,7 +31,6 @@ def get_val(keys: list, default: str = "") -> str:
             return v.strip()
     return default
 
-# 抓取截圖中的 OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE
 OKX_API_KEY = get_val(["OKX_API_KEY", "OKX_KEY", "API_KEY"])
 OKX_API_SECRET = get_val(["OKX_SECRET_KEY", "OKX_API_SECRET", "OKX_SECRET", "SECRET_KEY"])
 OKX_PASSPHRASE = get_val(["OKX_PASSPHRASE", "OKX_PASSWORD", "PASSPHRASE", "PASSWORD"])
@@ -43,7 +41,6 @@ IS_SIMULATED = SIM_VAL in ["1", "true", "yes"]
 TELEGRAM_BOT_TOKEN = get_val(["TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "BOT_TOKEN", "TG_TOKEN"])
 TELEGRAM_CHAT_ID = get_val(["TELEGRAM_CHAT_ID", "TG_CHAT_ID", "CHAT_ID"])
 
-# 風控與本金參數
 TOTAL_EQUITY_TWD = 15000.0
 MARGIN_PER_TRADE_USDT = float(get_val(["MIN_MARGIN", "MARGIN_USDT"], "20.0"))
 DEFAULT_LEVERAGE = int(get_val(["LEVERAGE"], "10"))
@@ -51,6 +48,9 @@ MAX_OPEN_POSITIONS = int(get_val(["MAX_POSITIONS", "MAX_POSITION"], "3"))
 CHECK_INTERVAL_SEC = 20
 
 EXCLUDE_SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "USDC-USDT-SWAP"]
+
+# 記錄錯誤冷卻，防止 TG 瘋狂洗版
+ERROR_COOLDOWN = {}
 
 # ==========================================
 # 📢 2. Telegram 模組
@@ -79,7 +79,7 @@ def send_telegram(message: str, target_chat_id: str = None):
         print(f"⚠️ TG 推播異常: {e}")
 
 # ==========================================
-# 🔐 3. OKX 官方標準簽名與 REST 請求
+# 🔐 3. OKX 底層請求與簽名
 # ==========================================
 def http_request(url: str, method: str = "GET", headers: dict = None, body: str = None) -> dict:
     req_headers = {"User-Agent": "Mozilla/5.0"}
@@ -98,10 +98,8 @@ def http_request(url: str, method: str = "GET", headers: dict = None, body: str 
         return {"code": "-1", "msg": f"網路錯誤: {e}"}
 
 def get_okx_headers(method: str, request_path: str, body: str = "") -> dict:
-    # 嚴格符合 OKX 官方 ISO8601 時間戳格式 (毫秒 3 位)
     now = datetime.now(timezone.utc)
     timestamp = now.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-    
     pre_hash = f"{timestamp}{method.upper()}{request_path}{body}"
     signature = base64.b64encode(
         hmac.new(OKX_API_SECRET.encode('utf-8'), pre_hash.encode('utf-8'), hashlib.sha256).digest()
@@ -143,10 +141,8 @@ def get_account_balance() -> tuple[float, float]:
                     avail_usdt = float(val_str)
                     break
             return total_eq, avail_usdt
-        else:
-            print(f"⚠️ 餘額查詢回報: {res.get('msg')}")
-    except Exception as e:
-        print(f"⚠️ 餘額解析異常: {e}")
+    except Exception:
+        pass
     return 0.0, 0.0
 
 def get_open_positions() -> list:
@@ -159,11 +155,8 @@ def get_open_positions() -> list:
         res = http_request(url, method="GET", headers=headers)
         if res.get("code") == "0" and res.get("data"):
             return [p for p in res["data"] if float(p.get("pos", "0")) != 0.0]
-        else:
-            if res.get("code") != "0":
-                print(f"⚠️ 持倉查詢回報: {res.get('msg')}")
-    except Exception as e:
-        print(f"⚠️ 持倉解析異常: {e}")
+    except Exception:
+        pass
     return []
 
 # ==========================================
@@ -301,15 +294,30 @@ def check_funding_rate_guard(inst_id: str, direction: str) -> tuple[bool, str]:
     return True, "費率安全"
 
 # ==========================================
-# 📊 7. 行情獲取與指標計算
+# 📊 7. 行情獲取與指標運算
 # ==========================================
-def get_instrument_info(inst_id: str) -> tuple[float, float]:
+def get_instrument_info(inst_id: str) -> tuple[float, float, float]:
+    """獲取面值、最小下單張數、最小價格精度 (tickSz)"""
     url = f"https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId={inst_id}"
     res = http_request(url)
     if res.get("code") == "0" and res.get("data"):
         item = res["data"][0]
-        return float(item.get("ctVal", 1.0)), float(item.get("lotSz", 1.0))
-    return 1.0, 1.0
+        ct_val = float(item.get("ctVal", 1.0))
+        lot_sz = float(item.get("lotSz", 1.0))
+        tick_sz = float(item.get("tickSz", 0.0001))
+        return ct_val, lot_sz, tick_sz
+    return 1.0, 1.0, 0.0001
+
+def format_price_by_tick(price: float, tick_sz: float) -> str:
+    """根據交易所 tickSz 動態格式化價格，杜絕 0.0000 與科學記號"""
+    if tick_sz <= 0:
+        return f"{price:.8f}".rstrip('0').rstrip('.')
+    
+    # 計算小數位數
+    decimals = max(0, -int(math.floor(math.log10(tick_sz))))
+    rounded = round(round(price / tick_sz) * tick_sz, decimals)
+    fmt = f"{rounded:.{decimals}f}"
+    return fmt
 
 def get_klines(inst_id: str, bar: str = "1H", limit: int = 50) -> list:
     url = f"https://www.okx.com/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
@@ -351,15 +359,21 @@ def calculate_indicators(candles: list) -> dict:
     }
 
 # ==========================================
-# 🎯 8. 下單委託 (合乎 15,000 元台幣規格)
+# 🎯 8. 下單委託 (完美適配 SATS 等超微小幣)
 # ==========================================
 def place_order(inst_id: str, direction: str, price: float, atr: float):
+    global ERROR_COOLDOWN
     if not OKX_API_KEY or not OKX_API_SECRET:
         print("⚠️ 未檢測到 OKX API 金鑰，略過發單。")
         return
 
+    # 冷卻檢查，同一個幣 30 秒內若失敗過，不重複轟炸 TG
+    now_ts = time.time()
+    if inst_id in ERROR_COOLDOWN and now_ts - ERROR_COOLDOWN[inst_id] < 30:
+        return
+
     side = "buy" if direction == "LONG" else "sell"
-    ct_val, lot_sz = get_instrument_info(inst_id)
+    ct_val, lot_sz, tick_sz = get_instrument_info(inst_id)
 
     contracts = (MARGIN_PER_TRADE_USDT * DEFAULT_LEVERAGE) / price / ct_val
     if lot_sz >= 1.0:
@@ -368,13 +382,16 @@ def place_order(inst_id: str, direction: str, price: float, atr: float):
         decimals = max(0, -int(math.floor(math.log10(lot_sz))))
         sz_str = f"{max(lot_sz, round(contracts, decimals)):.{decimals}f}"
 
-    # 止損：限額約 3.0 USDT (15% 保證金)
+    # 動態計算止盈止損距離
     sl_dist = min(price * 0.015, max(atr * 1.5, price * 0.012))
-    sl_price = price - sl_dist if direction == "LONG" else price + sl_dist
-
-    # 止盈：+45% ROI
+    sl_raw = price - sl_dist if direction == "LONG" else price + sl_dist
     tp_dist = price * (0.45 / DEFAULT_LEVERAGE)
-    tp_price = price + tp_dist if direction == "LONG" else price - tp_dist
+    tp_raw = price + tp_dist if direction == "LONG" else price - tp_dist
+
+    # 使用 tickSz 動態精度格式化，杜絕 0.0000 錯誤！
+    sl_price_str = format_price_by_tick(sl_raw, tick_sz)
+    tp_price_str = format_price_by_tick(tp_raw, tick_sz)
+    price_str = format_price_by_tick(price, tick_sz)
 
     path = "/api/v5/trade/order"
     body_dict = {
@@ -387,12 +404,12 @@ def place_order(inst_id: str, direction: str, price: float, atr: float):
         "attachAlgoOrds": [
             {
                 "attachAlgoClOrdId": f"sl_{int(time.time())}",
-                "slTriggerPx": f"{sl_price:.4f}",
+                "slTriggerPx": sl_price_str,
                 "slOrdPx": "-1"
             },
             {
                 "attachAlgoClOrdId": f"tp_{int(time.time())}",
-                "tpTriggerPx": f"{tp_price:.4f}",
+                "tpTriggerPx": tp_price_str,
                 "tpOrdPx": "-1"
             }
         ]
@@ -402,31 +419,41 @@ def place_order(inst_id: str, direction: str, price: float, atr: float):
     url = f"https://www.okx.com{path}"
 
     mode_text = "【OKX 模擬盤】" if IS_SIMULATED else "【OKX 實盤】"
-    print(f"🚀 {mode_text} 發送小幣開倉: {inst_id} {direction} {sz_str} 張 (保證金: {MARGIN_PER_TRADE_USDT} U)...")
+    print(f"🚀 {mode_text} 發送小幣開倉: {inst_id} {direction} {sz_str} 張 (現價:{price_str}, 止損:{sl_price_str})...")
     res = http_request(url, method="POST", headers=headers, body=body_str)
 
+    # 深度解析 OKX 交易回傳
     if res.get("code") == "0":
+        data_item = res.get("data", [{}])[0]
+        s_code = data_item.get("sCode", "0")
+        s_msg = data_item.get("sMsg", "")
+        
+        # 若 sCode 不為 0 代表附屬訂單或主單被拒
+        if s_code != "0":
+            ERROR_COOLDOWN[inst_id] = now_ts
+            print(f"⚠️ 下單細節回傳失敗: {s_code} - {s_msg}")
+            send_telegram(f"⚠️ <b>{mode_text} 下單被拒！</b>\n標的：<code>{inst_id}</code>\n原因：{s_msg} (代碼:{s_code})")
+            return
+
         tg_msg = (
             f"⚡ <b>{mode_text} 動態小幣狙擊成功！</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"標的幣種：<code>{inst_id}</code>\n"
             f"方向：<b>{'🟢 做多 LONG' if direction == 'LONG' else '🔴 做空 SHORT'}</b>\n"
-            f"現價：<code>{price}</code> USDT\n"
+            f"現價：<code>{price_str}</code> USDT\n"
             f"槓桿：<code>{DEFAULT_LEVERAGE}x</code> | 本金：<code>{MARGIN_PER_TRADE_USDT} USDT</code>\n"
             f"張數：<code>{sz_str} 張</code>\n"
-            f"🎯 止盈價：<code>{tp_price:.4f}</code> (+45%)\n"
-            f"🛡️ 止損價：<code>{sl_price:.4f}</code> (限額 ~3.0 U)\n"
+            f"🎯 止盈價：<code>{tp_price_str}</code> (+45%)\n"
+            f"🛡️ 止損價：<code>{sl_price_str}</code> (限額 ~3.0 U)\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"⏰ 時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         send_telegram(tg_msg)
     else:
+        ERROR_COOLDOWN[inst_id] = now_ts
         err_msg = res.get("msg", "未知原因")
         print(f"⚠️ 下單失敗: {err_msg}")
-        if "balance" in err_msg.lower() or "51008" in str(res.get("code")):
-            send_telegram(f"⚠️ <b>{mode_text} 下單失敗：可用保證金不足！</b>\n請確認 OKX 帳戶狀態。")
-        else:
-            send_telegram(f"⚠️ <b>{mode_text} 下單異常！</b>\n標的：{inst_id}\n原因：{err_msg}")
+        send_telegram(f"⚠️ <b>{mode_text} 下單異常！</b>\n標的：{inst_id}\n原因：{err_msg}")
 
 # ==========================================
 # 🔄 8. 動態全市場小幣狙擊工作線程
@@ -467,13 +494,11 @@ def altcoin_trading_worker():
                 # 超跌反彈
                 if (rsi <= 38.0 and ma_fast >= ma_slow and vol_surge >= 1.2) or (rsi <= 30.0):
                     signal = "LONG"
-                # 超買回調
+                # 超買回調 (如 SATS 等)
                 elif (rsi >= 64.0 and ma_fast <= ma_slow and vol_surge >= 1.2) or (rsi >= 70.0):
                     signal = "SHORT"
 
                 if signal:
-                    print(f"🎯 鎖定小幣信號：{inst_id} {signal} (價:{price}, RSI:{rsi:.1f}, 爆量:{vol_surge:.2f}x)")
-                    
                     is_safe, reason = check_funding_rate_guard(inst_id, signal)
                     if not is_safe:
                         print(f"🛡️ 費率過高，放棄開倉: {reason}")
@@ -495,20 +520,10 @@ def altcoin_trading_worker():
 # ==========================================
 def main():
     print("=" * 60)
-    print("🚀 [OKX Quant Bot] 全市場小幣狙擊版正式上線！")
-    
-    # 診斷所有環境變數
-    k_stat = f"已載入 ({OKX_API_KEY[:4]}...)" if OKX_API_KEY else "❌ 未找到 (請檢查 OKX_API_KEY)"
-    s_stat = f"已載入 ({OKX_API_SECRET[:4]}...)" if OKX_API_SECRET else "❌ 未找到 (請檢查 OKX_SECRET_KEY)"
-    p_stat = "已載入" if OKX_PASSPHRASE else "❌ 未找到 (請檢查 OKX_PASSPHRASE)"
-    
-    print(f"🔑 API KEY:    {k_stat}")
-    print(f"🔑 SECRET KEY: {s_stat}")
-    print(f"🔑 PASSPHRASE: {p_stat}")
-    print(f"🎯 交易模式:   {'官方模擬盤 (Demo)' if IS_SIMULATED else '實盤交易'}")
+    print("🚀 [OKX Quant Bot] 全市場小幣狙擊 (精度適配版) 啟動！")
+    print(f"🎯 交易模式: {'官方模擬盤 (Demo)' if IS_SIMULATED else '實盤交易'}")
     print("=" * 60)
 
-    # 初次連線查帳測試
     total_eq, avail_usdt = get_account_balance()
     print(f"📊 [OKX 帳戶連線測試] 總淨值: {total_eq:,.2f} USD | 可用 USDT: {avail_usdt:,.2f}")
 
