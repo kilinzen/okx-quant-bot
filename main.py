@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import requests
 
 # ==============================================================================
-# 🔑 環境變數讀取 (Railway / 伺服器配置)
+# 🔑 環境變數讀取 (沿用您在 Railway 設定好的，完全不需要重設！)
 # ==============================================================================
 OKX_API_KEY = os.getenv("OKX_API_KEY", "")
 OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY", "")
@@ -20,13 +20,13 @@ IS_SIMULATED = os.getenv("IS_SIMULATED", "true").lower() == "true"
 OKX_API_URL = "https://www.okx.com"
 
 # ==============================================================================
-# ⚙️ 完整還原手機版參數配置 (Strictly Matched to CryptoViewModel.kt)
+# ⚙️ 完整還原手機版參數配置
 # ==============================================================================
 LEVERAGE = 10
-TOTAL_CAPITAL_RISK_PER_TRADE = 0.008  # 總資金 0.8% 動態風險
+FIXED_USDT_AMOUNT = 20.0              # 單筆投入保證金 (約 20 USDT)
 MIN_CONFIDENCE_SCORE = 84             # 狙擊手信心門檻
 MIN_AMPLITUDE = 0.025                 # 最小振幅 2.5% 避開死魚盤
-BTC_MAX_VOLATILITY = 0.045            # BTC 波動率上限 (防黑天鵝吸血)
+BTC_MAX_VOLATILITY = 0.045            # BTC 波動率上限
 
 # 手機版神級平倉與鎖利機制
 BE_TRIGGER_ROI = 0.20                 # 浮盈達到 +20% ROI，強制推到保本線
@@ -89,14 +89,14 @@ def fetch_candles(inst_id: str, bar="1H", limit=100):
         resp = requests.get(url, timeout=8).json()
         if resp.get("code") == "0":
             data = resp.get("data", [])
-            data.reverse() # 時間從小到大
+            data.reverse()
             return data
     except Exception:
         pass
     return []
 
 # ==============================================================================
-# 🧮 純 Python 原生數學計算 (免 Pandas / 免 Numpy，保證不報錯)
+# 🧮 純 Python 數學演算法 (完全免第三方依賴)
 # ==============================================================================
 def calc_ema(values, span):
     alpha = 2.0 / (span + 1.0)
@@ -106,7 +106,7 @@ def calc_ema(values, span):
     return ema
 
 # ==============================================================================
-# 🧠 1:1 還原手機版量化決策引擎
+# 🧠 1:1 手機版量化決策引擎
 # ==============================================================================
 def check_btc_macro():
     candles = fetch_candles("BTC-USDT-SWAP", "1H", 60)
@@ -117,7 +117,6 @@ def check_btc_macro():
     highs = [float(c[2]) for c in candles]
     lows = [float(c[3]) for c in candles]
     
-    # 24H 波動率
     recent_high = max(highs[-24:])
     recent_low = min(lows[-24:])
     volatility = (recent_high - recent_low) / closes[-1]
@@ -139,8 +138,6 @@ def analyze_symbol(inst_id: str, btc_trend: str):
     vols = [float(c[5]) for c in candles]
     
     curr_price = closes[-1]
-    
-    # 振幅檢查：避開死魚盤
     recent_high = max(highs[-24:])
     recent_low = min(lows[-24:])
     amplitude = (recent_high - recent_low) / curr_price
@@ -150,7 +147,6 @@ def analyze_symbol(inst_id: str, btc_trend: str):
     ema20 = calc_ema(closes, 20)
     ema50 = calc_ema(closes, 50)
     
-    # ATR (14) 計算
     tr_list = []
     for j in range(1, len(candles)):
         tr = max(highs[j] - lows[j], abs(highs[j] - closes[j-1]), abs(lows[j] - closes[j-1]))
@@ -158,7 +154,6 @@ def analyze_symbol(inst_id: str, btc_trend: str):
     recent_tr = tr_list[-14:]
     atr = sum(recent_tr) / len(recent_tr) if recent_tr else (curr_price * 0.02)
     
-    # 量能暴增
     prev_vols = vols[-20:-1]
     vol_avg = sum(prev_vols) / len(prev_vols) if prev_vols else 1.0
     vol_surge = vols[-1] / max(vol_avg, 1e-6)
@@ -179,10 +174,8 @@ def analyze_symbol(inst_id: str, btc_trend: str):
     if signal and confidence >= MIN_CONFIDENCE_SCORE:
         sl_dist = atr * 1.5
         tp_dist = atr * 3.2
-        
         sl = curr_price - sl_dist if signal == "LONG" else curr_price + sl_dist
         tp = curr_price + tp_dist if signal == "LONG" else curr_price - tp_dist
-        
         return {
             "symbol": inst_id,
             "signal": signal,
@@ -195,80 +188,112 @@ def analyze_symbol(inst_id: str, btc_trend: str):
     return None
 
 # ==============================================================================
-# 🛡️ 實時持倉管理：保本 (BE Protect) + 波段鎖利 + 死魚盤超時
+# 🎯 實際開倉執行 (OKX 交易接口)
+# ==============================================================================
+def open_position(sig: dict):
+    inst_id = sig["symbol"]
+    side = "buy" if sig["signal"] == "LONG" else "sell"
+    
+    # 1. 設定 10 倍全倉槓桿
+    okx_request("POST", "/api/v5/account/set-leverage", {
+        "instId": inst_id,
+        "lever": str(LEVERAGE),
+        "mgnMode": "cross"
+    })
+    
+    # 2. 市價開倉 (投入約 FIXED_USDT_AMOUNT 的合約張數，OKX 通常以 1 張為單位測試)
+    order_body = {
+        "instId": inst_id,
+        "tdMode": "cross",
+        "side": side,
+        "ordType": "market",
+        "sz": "1" # 預設 1 張合約 (避免保證金不足)
+    }
+    
+    res = okx_request("POST", "/api/v5/trade/order", order_body)
+    if res and res.get("code") == "0":
+        send_telegram(
+            f"🚀 *【實際開倉成功】* `{inst_id}`\n"
+            f"方向: `{sig['signal']}` | 置信度: `{sig['confidence']}`\n"
+            f"進場價: `{sig['price']}`\n"
+            f"止損價: `{sig['sl']:.4f}` | 止盈價: `{sig['tp']:.4f}`"
+        )
+    else:
+        err_msg = res.get('msg', '未知錯誤') if res else '連線失敗'
+        print(f"下單失敗 ({inst_id}): {err_msg}")
+        send_telegram(f"⚠️ `{inst_id}` 開倉失敗: {err_msg}")
+
+# ==============================================================================
+# 🛡️ 實時持倉管理 (保本 + 波段鎖利 + 超時)
 # ==============================================================================
 active_positions_tracker = {}
 
 def manage_open_positions():
-    pos_res = okx_request("GET", "/api/v5/account/positions")
-    if not pos_res or pos_res.get("code") != "0":
-        return
-    
-    positions = pos_res.get("data", [])
-    now_ts = time.time()
-    
-    for pos in positions:
-        inst_id = pos["instId"]
-        pos_amt = float(pos.get("pos", 0))
-        if pos_amt == 0:
-            active_positions_tracker.pop(inst_id, None)
-            continue
-            
-        upl_ratio = float(pos.get("uplRatio", 0)) # ROI
+    try:
+        pos_res = okx_request("GET", "/api/v5/account/positions")
+        if not pos_res or pos_res.get("code") != "0":
+            return
         
-        if inst_id not in active_positions_tracker:
-            active_positions_tracker[inst_id] = {
-                "open_time": now_ts,
-                "peak_roi": upl_ratio,
-                "be_protected": False
-            }
-            
-        tracker = active_positions_tracker[inst_id]
-        if upl_ratio > tracker["peak_roi"]:
-            tracker["peak_roi"] = upl_ratio
-            
-        # 1. 保本防護 (BE Protect)
-        if not tracker["be_protected"] and upl_ratio >= BE_TRIGGER_ROI:
-            tracker["be_protected"] = True
-            send_telegram(
-                f"🛡️ *【自動保本防護觸發】* `{inst_id}`\n"
-                f"當前浮盈已達: `+{upl_ratio*100:.1f}%`\n"
-                f"鎖定成本價出場，保證該筆零虧損！"
-            )
-
-        # 2. 波段移動鎖利 (Wave Trailing)
-        if upl_ratio >= TRAILING_TRIGGER_ROI:
-            floor_roi = tracker["peak_roi"] * TRAILING_PROFIT_FLOOR
-            if upl_ratio <= floor_roi:
-                send_telegram(
-                    f"🏆 *【波段利潤大成收割】* `{inst_id}`\n"
-                    f"歷史最高浮盈: `+{tracker['peak_roi']*100:.1f}%`\n"
-                    f"回撤觸及利潤地板線 `+{floor_roi*100:.1f}%`，市價停利出場！"
-                )
-                close_market(inst_id)
-                active_positions_tracker.pop(inst_id, None)
+        positions = pos_res.get("data", [])
+        now_ts = time.time()
+        
+        # 標記當前存在的幣種
+        current_holding_symbols = set()
+        
+        for pos in positions:
+            inst_id = pos["instId"]
+            pos_amt = float(pos.get("pos", 0))
+            if pos_amt == 0:
                 continue
+                
+            current_holding_symbols.add(inst_id)
+            upl_ratio = float(pos.get("uplRatio", 0))
+            
+            if inst_id not in active_positions_tracker:
+                active_positions_tracker[inst_id] = {
+                    "open_time": now_ts,
+                    "peak_roi": upl_ratio,
+                    "be_protected": False
+                }
+                
+            tracker = active_positions_tracker[inst_id]
+            if upl_ratio > tracker["peak_roi"]:
+                tracker["peak_roi"] = upl_ratio
+                
+            # 1. 保本防護
+            if not tracker["be_protected"] and upl_ratio >= BE_TRIGGER_ROI:
+                tracker["be_protected"] = True
+                send_telegram(f"🛡️ *【自動保本防護觸發】* `{inst_id}` 浮盈: `+{upl_ratio*100:.1f}%`，鎖定零虧損！")
 
-        # 3. 90 分鐘動能衰竭超時
-        time_held = now_ts - tracker["open_time"]
-        if time_held >= MOMENTUM_TIMEOUT_SEC and -0.05 <= upl_ratio <= 0.05:
-            send_telegram(
-                f"⏱️ *【動能衰竭超時退場】* `{inst_id}`\n"
-                f"持倉超過 90 分鐘無動能（死魚盤），保本/微損撤出資金！"
-            )
-            close_market(inst_id)
-            active_positions_tracker.pop(inst_id, None)
-            continue
+            # 2. 波段鎖利
+            if upl_ratio >= TRAILING_TRIGGER_ROI:
+                floor_roi = tracker["peak_roi"] * TRAILING_PROFIT_FLOOR
+                if upl_ratio <= floor_roi:
+                    send_telegram(f"🏆 *【波段利潤收割】* `{inst_id}` 觸及利潤地板線 `+{floor_roi*100:.1f}%`，市價停利！")
+                    close_market(inst_id)
+                    continue
+
+            # 3. 超時退場
+            time_held = now_ts - tracker["open_time"]
+            if time_held >= MOMENTUM_TIMEOUT_SEC and -0.05 <= upl_ratio <= 0.05:
+                send_telegram(f"⏱️ *【動能衰竭超時退場】* `{inst_id}` 90 分鐘無動能，保本撤出！")
+                close_market(inst_id)
+                continue
+                
+        # 清理已平倉的記錄
+        for old_sym in list(active_positions_tracker.keys()):
+            if old_sym not in current_holding_symbols:
+                active_positions_tracker.pop(old_sym, None)
+                
+    except Exception as e:
+        print(f"管理持倉異常: {e}")
 
 def close_market(inst_id: str):
-    body = {
-        "instId": inst_id,
-        "mgnMode": "cross"
-    }
+    body = {"instId": inst_id, "mgnMode": "cross"}
     okx_request("POST", "/api/v5/trade/close-position", body)
 
 # ==============================================================================
-# 🚀 主循環排程
+# 🚀 主循環排程 (永不閃退守護)
 # ==============================================================================
 def run_loop():
     send_telegram("🤖 *OKX 手機版原版移植量化核心已在 Railway 正常啟動！*")
@@ -283,20 +308,19 @@ def run_loop():
                 continue
                 
             for symbol in MONITOR_SYMBOLS:
+                # 若已有該幣種持倉，不重複開倉
+                if symbol in active_positions_tracker:
+                    continue
+                    
                 res = analyze_symbol(symbol, btc_trend)
                 if res:
-                    send_telegram(
-                        f"🎯 *【狙擊手信號開倉】* `{res['symbol']}`\n"
-                        f"方向: `{res['signal']}` | 置信度: `{res['confidence']}`\n"
-                        f"現價: `{res['price']}`\n"
-                        f"自適應止損: `{res['sl']:.4f}` | 止盈: `{res['tp']:.4f}`"
-                    )
-                    time.sleep(2)
+                    open_position(res)
+                    time.sleep(3)
                     
         except Exception as e:
-            print(f"Loop Error: {e}")
+            print(f"主循環異常保護: {e}")
             
-        time.sleep(30)
+        time.sleep(30) # 每 30 秒健康循環
 
 if __name__ == "__main__":
     run_loop()
