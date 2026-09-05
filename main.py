@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🚀 OKX 量化全自動合約交易機器人 (持倉模式自適應 + 穩健下單版)
-- 🎯 自動適配「買賣模式 (net)」與「開平模式 (long/short)」
-- 🚀 先開倉後止損解耦機制：徹底消滅 All operations failed
+🚀 OKX 量化全自動合約交易機器人 (過濾下架幣 + 活躍小幣動態狙擊版)
+- 🛡️ 自動過濾 51087 下架死幣 (如 SATS 等模擬盤下架合約)
+- 🎯 只鎖定 OKX 官方 status=='live' 的可交易活躍小幣
 - 🔑 完美讀取 Railway 變數：OKX_SECRET_KEY, OKX_API_KEY, OKX_PASSPHRASE
 - 💰 15,000 元台幣本金風控：單筆 20 USDT, 槓桿 10x
-- 💬 Telegram 開倉即時通知 + 雙向查帳
+- 💬 Telegram 雙向查詢 + 即時開平倉通知
 """
 
 import os
@@ -45,9 +45,11 @@ TOTAL_EQUITY_TWD = 15000.0
 MARGIN_PER_TRADE_USDT = float(get_val(["MIN_MARGIN", "MARGIN_USDT"], "20.0"))
 DEFAULT_LEVERAGE = int(get_val(["LEVERAGE"], "10"))
 MAX_OPEN_POSITIONS = int(get_val(["MAX_POSITIONS", "MAX_POSITION"], "3"))
-CHECK_INTERVAL_SEC = 20
+CHECK_INTERVAL_SEC = 15
 
-EXCLUDE_SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "USDC-USDT-SWAP"]
+# 排除大幣與已確認在模擬盤下架的合約
+EXCLUDE_SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "USDC-USDT-SWAP", "SATS-USDT-SWAP"]
+DEAD_SYMBOLS_BLACKLIST = set(EXCLUDE_SYMBOLS)
 ERROR_COOLDOWN = {}
 
 # ==========================================
@@ -158,9 +160,21 @@ def get_open_positions() -> list:
     return []
 
 # ==========================================
-# 🎯 4. 全市場動態小幣掃描 (手機版原版核心)
+# 🎯 4. 全市場動態小幣掃描 (嚴格過濾未上線/已下架幣)
 # ==========================================
+def get_live_tradable_instruments() -> set:
+    """獲取當前真正處於 live 可交易狀態的永續合約"""
+    url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
+    res = http_request(url)
+    live_set = set()
+    if res.get("code") == "0" and res.get("data"):
+        for item in res["data"]:
+            if item.get("state") == "live":
+                live_set.add(item.get("instId"))
+    return live_set
+
 def get_top_volatile_altcoins(limit: int = 30) -> list:
+    live_set = get_live_tradable_instruments()
     url = "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
     res = http_request(url)
     if res.get("code") != "0" or not res.get("data"):
@@ -173,14 +187,16 @@ def get_top_volatile_altcoins(limit: int = 30) -> list:
         inst_id = t.get("instId", "")
         if not inst_id.endswith("-USDT-SWAP"):
             continue
-        if inst_id in EXCLUDE_SYMBOLS:
+        if inst_id in DEAD_SYMBOLS_BLACKLIST:
+            continue
+        if live_set and inst_id not in live_set:
             continue
 
         vol_24h = float(t.get("volCcy24h", "0.0"))
         last_px = float(t.get("last", "0.0"))
         open_24h = float(t.get("open24h", "0.0"))
 
-        if last_px <= 0 or vol_24h < 1_000_000:
+        if last_px <= 0 or vol_24h < 2_000_000:
             continue
 
         change_pct = abs((last_px - open_24h) / open_24h) if open_24h > 0 else 0
@@ -292,7 +308,7 @@ def check_funding_rate_guard(inst_id: str, direction: str) -> tuple[bool, str]:
     return True, "費率安全"
 
 # ==========================================
-# 📊 7. 行情獲取與指標運算
+# 📊 7. 行情獲取與指標計算
 # ==========================================
 def get_instrument_info(inst_id: str) -> tuple[float, float, float]:
     url = f"https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId={inst_id}"
@@ -352,7 +368,7 @@ def calculate_indicators(candles: list) -> dict:
     }
 
 # ==========================================
-# 🎯 8. 下單委託 (全自動相容 net 與 long/short 模式)
+# 🎯 8. 下單委託 (過濾 51087 下架合約)
 # ==========================================
 def execute_order_request(body_dict: dict) -> dict:
     body_str = json.dumps(body_dict)
@@ -361,13 +377,13 @@ def execute_order_request(body_dict: dict) -> dict:
     return http_request(url, method="POST", headers=headers, body=body_str)
 
 def place_order(inst_id: str, direction: str, price: float, atr: float):
-    global ERROR_COOLDOWN
+    global ERROR_COOLDOWN, DEAD_SYMBOLS_BLACKLIST
     if not OKX_API_KEY or not OKX_API_SECRET:
         print("⚠️ 未檢測到 OKX API 金鑰，略過發單。")
         return
 
     now_ts = time.time()
-    if inst_id in ERROR_COOLDOWN and now_ts - ERROR_COOLDOWN[inst_id] < 30:
+    if inst_id in ERROR_COOLDOWN and now_ts - ERROR_COOLDOWN[inst_id] < 60:
         return
 
     side = "buy" if direction == "LONG" else "sell"
@@ -383,7 +399,7 @@ def place_order(inst_id: str, direction: str, price: float, atr: float):
     price_str = format_price_by_tick(price, tick_sz)
     mode_text = "【OKX 模擬盤】" if IS_SIMULATED else "【OKX 實盤】"
 
-    # 嘗試 1：使用開平模式 (posSide: "long" / "short")
+    # 優先嘗試 開平倉模式 (posSide: "long" / "short")
     pos_side_opt = "long" if direction == "LONG" else "short"
     base_order = {
         "instId": inst_id,
@@ -394,27 +410,29 @@ def place_order(inst_id: str, direction: str, price: float, atr: float):
         "sz": sz_str
     }
 
-    print(f"🚀 {mode_text} 發送小幣市價開倉: {inst_id} {direction} {sz_str} 張 (嘗試 posSide={pos_side_opt})...")
+    print(f"🚀 {mode_text} 發送小幣市價開倉: {inst_id} {direction} {sz_str} 張...")
     res = execute_order_request(base_order)
 
-    # 嘗試 2：若報錯 posSide error (51000)，自動切換為買賣模式 (posSide: "net")
-    if res.get("code") != "0":
-        err_msg = res.get("msg", "")
+    # 檢查是否為 51000 posSide 錯誤，若是切換為 net
+    data_item = res.get("data", [{}])[0] if res.get("data") else {}
+    s_code = data_item.get("sCode", "")
+    err_msg = res.get("msg", "")
+
+    if "posSide" in err_msg or "51000" in str(res.get("code")) or s_code == "51000":
+        base_order["posSide"] = "net"
+        res = execute_order_request(base_order)
         data_item = res.get("data", [{}])[0] if res.get("data") else {}
         s_code = data_item.get("sCode", "")
-        
-        if "posSide" in err_msg or "51000" in str(res.get("code")) or s_code == "51000":
-            print(f"🔄 偵測到帳戶為買賣模式，切換為 posSide: 'net' 重新提交...")
-            base_order["posSide"] = "net"
-            res = execute_order_request(base_order)
 
-    # 驗證最終下單結果
-    data_item = res.get("data", [{}])[0] if res.get("data") else {}
-    s_code = data_item.get("sCode", "0")
     s_msg = data_item.get("sMsg", "")
 
+    # 🚨 關鍵攔截：若遇上 51087 (Listing canceled / 下架幣)，直接列入黑名單，不再重複嘗試！
+    if s_code == "51087" or "51087" in str(res.get("code")) or "listing canceled" in s_msg.lower():
+        print(f"🚫 {inst_id} 已在交易所停止交易 (51087)，自動加入永久黑名單！")
+        DEAD_SYMBOLS_BLACKLIST.add(inst_id)
+        return
+
     if res.get("code") == "0" and s_code == "0":
-        # 下單成功！
         sl_dist = min(price * 0.015, max(atr * 1.5, price * 0.012))
         sl_raw = price - sl_dist if direction == "LONG" else price + sl_dist
         tp_dist = price * (0.45 / DEFAULT_LEVERAGE)
@@ -441,7 +459,6 @@ def place_order(inst_id: str, direction: str, price: float, atr: float):
         ERROR_COOLDOWN[inst_id] = now_ts
         fail_reason = s_msg if s_msg else res.get("msg", "未知原因")
         print(f"⚠️ 下單失敗細節: 代碼={s_code or res.get('code')}, 訊息={fail_reason}")
-        send_telegram(f"⚠️ <b>{mode_text} 下單異常！</b>\n標的：{inst_id}\n原因：{fail_reason}")
 
 # ==========================================
 # 🔄 8. 動態全市場小幣狙擊工作線程
@@ -463,7 +480,7 @@ def altcoin_trading_worker():
                 continue
 
             for inst_id in dynamic_targets:
-                if inst_id in active_symbols:
+                if inst_id in active_symbols or inst_id in DEAD_SYMBOLS_BLACKLIST:
                     continue
 
                 candles = get_klines(inst_id, bar="1H", limit=40)
@@ -482,7 +499,7 @@ def altcoin_trading_worker():
                 # 超跌反彈
                 if (rsi <= 38.0 and ma_fast >= ma_slow and vol_surge >= 1.2) or (rsi <= 30.0):
                     signal = "LONG"
-                # 超買回調 (如 SATS)
+                # 超買回調
                 elif (rsi >= 64.0 and ma_fast <= ma_slow and vol_surge >= 1.2) or (rsi >= 70.0):
                     signal = "SHORT"
 
@@ -508,7 +525,7 @@ def altcoin_trading_worker():
 # ==========================================
 def main():
     print("=" * 60)
-    print("🚀 [OKX Quant Bot] 全市場小幣狙擊 (雙模式自適應版) 啟動！")
+    print("🚀 [OKX Quant Bot] 全市場小幣狙擊 (過濾下架幣版) 啟動！")
     print(f"🎯 交易模式: {'官方模擬盤 (Demo)' if IS_SIMULATED else '實盤交易'}")
     print("=" * 60)
 
