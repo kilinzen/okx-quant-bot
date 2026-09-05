@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🚀 OKX 量化全自動合約交易機器人 (Railway 永不退出強韌版)
-- 🔒 主線程強韌心跳硬鎖：徹底防止任何異常導致容器 Exit / Stopping Container
+🚀 OKX 量化全自動合約交易機器人 (Railway 24H 穩定長駐版)
 - 💰 本金規格：15,000 TWD (單筆 20 USDT, 槓桿 10x, 嚴格止損)
-- 💬 Telegram 雙向查詢：在群組輸入「帳戶」、「/status」、「查帳」秒回
+- 💬 Telegram 全變數相容：支援 TG_BOT_TOKEN / TELEGRAM_BOT_TOKEN，群組輸入「帳戶」秒回
 - 🛡️ 資金費率守護者：實時攔截 ASTER 類高頻吸血幣
 """
 
@@ -22,15 +21,28 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ==========================================
-# ⚙️ 1. 系統與環境變數設定
+# ⚙️ 1. 系統與環境變數設定 (相容各種命名)
 # ==========================================
 OKX_API_KEY = os.getenv("OKX_API_KEY", "")
 OKX_API_SECRET = os.getenv("OKX_API_SECRET", "")
 OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
 IS_SIMULATED = os.getenv("OKX_SIMULATED", "0").lower() in ["1", "true"]
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# 自動相容各種 Telegram 變數名稱
+TELEGRAM_BOT_TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN") or 
+    os.getenv("TG_BOT_TOKEN") or 
+    os.getenv("BOT_TOKEN") or 
+    os.getenv("TG_TOKEN") or 
+    ""
+)
+
+TELEGRAM_CHAT_ID = (
+    os.getenv("TELEGRAM_CHAT_ID") or 
+    os.getenv("TG_CHAT_ID") or 
+    os.getenv("CHAT_ID") or 
+    ""
+)
 
 # 💰 15,000 元台幣本金風控配置
 TOTAL_EQUITY_TWD = 15000.0
@@ -71,7 +83,7 @@ def send_telegram(message: str, target_chat_id: str = None):
         with urllib.request.urlopen(req, timeout=8):
             pass
     except Exception as e:
-        print(f"⚠️ TG 推播發送失敗 (非致命): {e}")
+        print(f"⚠️ TG 發送失敗: {e}")
 
 # ==========================================
 # 🔐 3. OKX API 請求與簽名
@@ -143,7 +155,7 @@ def get_open_positions() -> list:
     return []
 
 # ==========================================
-# 💬 4. Telegram 雙向查詢監聽
+# 💬 4. Telegram 雙向查詢監聽 (群組專用)
 # ==========================================
 def format_status_message() -> str:
     mode_str = "模擬盤 (Demo)" if IS_SIMULATED else "實盤 (Real)"
@@ -181,10 +193,11 @@ def format_status_message() -> str:
 
 def telegram_listener():
     if not TELEGRAM_BOT_TOKEN:
-        print("ℹ️ 未設定 TELEGRAM_BOT_TOKEN，略過 TG 監聽。")
+        print("⚠️ 未檢測到 Telegram Token (請確認變數是否設定為 TELEGRAM_BOT_TOKEN 或 TG_BOT_TOKEN)")
         return
+    
+    print("💬 ✅ Telegram 雙向對話監聽器啟動成功！正在監聽群組訊息...")
     last_update_id = 0
-    print("💬 Telegram 雙向對話監聽器已啟動...")
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={last_update_id + 1}&timeout=20"
@@ -201,6 +214,8 @@ def telegram_listener():
                             continue
 
                         clean_cmd = text.split("@")[0].lower()
+                        print(f"📩 收到 TG 訊息: '{text}' 來自 chat_id: {chat_id}")
+
                         if clean_cmd in ["/status", "帳戶", "查帳", "狀態", "持倉", "/account"]:
                             reply = format_status_message()
                             send_telegram(reply, target_chat_id=chat_id)
@@ -230,22 +245,19 @@ def check_funding_rate_guard(inst_id: str, direction: str) -> tuple[bool, str]:
     hourly_rate = funding_rate / interval_hours
     is_long = direction.upper() in ["BUY", "LONG"]
 
-    # 極端費率熔斷
     if abs(funding_rate) >= 0.0005 or abs(hourly_rate) >= 0.0000625:
         return False, f"🚨 [極端費率熔斷] {inst_id} 單期 {funding_rate*100:.3f}% (每小時 {hourly_rate*100:.4f}%)，禁止進場！"
 
-    # 做多高正費率攔截
     if is_long and hourly_rate > 0.00003:
         return False, f"🚨 [高資金費攔截] {inst_id} 當前正費率 {funding_rate*100:.3f}% (每 {interval_hours:.0f}h 扣一次)，拒絕開多！"
 
-    # 做空深負費率攔截
     if not is_long and hourly_rate < -0.00003:
         return False, f"🚨 [深負資金費攔截] {inst_id} 當前深負費率 {funding_rate*100:.3f}% (每 {interval_hours:.0f}h 扣一次)，拒絕開空！"
 
     return True, "費率安全"
 
 # ==========================================
-# 📊 6. 合約規格與指標計算
+# 📊 6. 行情與指標計算
 # ==========================================
 def get_instrument_info(inst_id: str) -> tuple[float, float]:
     url = f"https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId={inst_id}"
@@ -371,8 +383,7 @@ def place_order(inst_id: str, direction: str, price: float, atr: float):
 # 🔄 8. 背景交易工作線程
 # ==========================================
 def trading_worker():
-    """獨立背景線程，即使發生任何錯誤也不影響主線程長駐"""
-    print("🤖 交易監控線程正式啟動...")
+    print("🤖 交易監控線程已就緒...")
     while True:
         try:
             positions = get_open_positions()
@@ -416,55 +427,35 @@ def trading_worker():
             time.sleep(CHECK_INTERVAL_SEC)
 
         except Exception as e:
-            print(f"⚠️ 交易線程異常 (已自動攔截並恢復): {e}")
-            traceback.print_exc()
+            print(f"⚠️ 交易線程異常: {e}")
             time.sleep(5)
 
 # ==========================================
-# 🔒 9. 主程序：死鎖保護心跳循環 (絕對永不退出)
+# 🔒 9. 主程序：24H 長駐守護
 # ==========================================
 def main():
     print("=" * 60)
-    print("🚀 [OKX Quant Bot] 正在初始化啟動...")
+    print("🚀 [OKX Quant Bot] 啟動中...")
+    print(f"🔑 Telegram Token 狀態: {'已設定 ✅' if TELEGRAM_BOT_TOKEN else '未設定 ❌'}")
+    print(f"🔑 Telegram Chat ID 狀態: {'已設定 ✅' if TELEGRAM_CHAT_ID else '未設定 ❌'}")
     print("=" * 60)
 
     # 1. 啟動 Telegram 監聽線程
     t_tg = threading.Thread(target=telegram_listener, daemon=True)
     t_tg.start()
 
-    # 2. 啟動量化交易工作線程
+    # 2. 啟動量化交易線程
     t_trade = threading.Thread(target=trading_worker, daemon=True)
     t_trade.start()
 
-    # 3. 發送 Telegram 上線通知
-    mode_desc = "官方模擬盤" if IS_SIMULATED else "真實資金盤"
-    init_msg = (
-        f"🤖 <b>【OKX 量化機器人・永不退出版】已上線！</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"模式：<code>{mode_desc}</code>\n"
-        f"本金規格：<code>{TOTAL_EQUITY_TWD:,.0f} TWD (單筆 {MARGIN_PER_TRADE_USDT} U / {DEFAULT_LEVERAGE}x)</code>\n"
-        f"持倉上限：<code>最多 {MAX_OPEN_POSITIONS} 筆</code>\n"
-        f"🛡️ 資金費率防護：<b>ASTER 等吸血幣即時攔截</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"👉 在群組隨時發送 <code>帳戶</code> 或 <code>/status</code> 即可查帳！"
-    )
-    send_telegram(init_msg)
-
-    # 4. 🔒 主線程死鎖心跳保護：只要 Python 不被外力強制殺死，它將永久鎖定在此循環！
+    # 3. 主線程死鎖心跳 (永不退出)
     loop_count = 0
     while True:
         loop_count += 1
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        # 每 30 秒印出一次心跳日誌，向 Railway 證明程序 100% 活躍
         if loop_count % 3 == 0:
             print(f"[{now_str}] 💓 機器人健康運作中 (Loop: {loop_count}) | 守護在線...")
         time.sleep(10)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"❌ 嚴重主程序崩潰: {e}")
-        traceback.print_exc()
-        # 即使崩潰也休眠 60 秒印出日誌，防止無聲退出
-        time.sleep(60)
+    main()
