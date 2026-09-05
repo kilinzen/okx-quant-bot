@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🚀 OKX 量化全自動合約交易機器人 (全市場小幣狙擊 + 模擬盤精準對帳版)
-- 💰 正確讀取模擬盤 98,000+ USD 資產與 1,277+ USDT 可用保證金
-- 🎯 全市場動態小幣狙擊：排除 BTC/ETH，全市場篩選活躍高彈性小幣
-- 💬 Telegram 雙向查詢：在群組輸入「帳戶」、「/status」即時查帳
-- 🛡️ 資金費率安全守護者：實時攔截 ASTER 類高頻吸血幣
-- 🔒 24H 永不退出守護
+🚀 OKX 量化全自動合約交易機器人 (全市場小幣狙擊 + 金鑰精準對齊版)
+- 🔑 全變數相容：自動修復 OKX_API_KEY / API_KEY / PASSPHRASE 等命名
+- 💰 模擬盤 98,000+ USD 實時連線
+- 🎯 全市場動態小幣狙擊：排除大幣，專注暴動小幣
+- 💬 Telegram 雙向查詢：輸入「帳戶」即時查帳
+- 🛡️ 資金費率安全守護者：實時攔截 ASTER 吸血幣
 """
 
 import os
@@ -22,31 +22,24 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ==========================================
-# ⚙️ 1. 系統與環境變數設定
+# ⚙️ 1. 系統與環境變數設定 (自動相容所有變數命名)
 # ==========================================
-OKX_API_KEY = os.getenv("OKX_API_KEY", "").strip()
-OKX_API_SECRET = os.getenv("OKX_API_SECRET", "").strip()
-OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "").strip()
+def get_env_variable(keys: list, default: str = "") -> str:
+    for k in keys:
+        val = os.getenv(k)
+        if val is not None and val.strip() != "":
+            return val.strip()
+    return default
 
-# 模擬盤開關 (預設啟用 1)
-SIM_ENV = os.getenv("OKX_SIMULATED", "1").strip().lower()
+OKX_API_KEY = get_env_variable(["OKX_API_KEY", "OKX_KEY", "API_KEY", "KEY"])
+OKX_API_SECRET = get_env_variable(["OKX_API_SECRET", "OKX_SECRET", "API_SECRET", "SECRET"])
+OKX_PASSPHRASE = get_env_variable(["OKX_PASSPHRASE", "OKX_PASSWORD", "PASSPHRASE", "PASSWORD"])
+
+SIM_ENV = get_env_variable(["OKX_SIMULATED", "SIMULATED", "IS_DEMO"], "1").lower()
 IS_SIMULATED = SIM_ENV in ["1", "true", "yes"]
 
-# 相容各類 TG 命名
-TELEGRAM_BOT_TOKEN = (
-    os.getenv("TELEGRAM_BOT_TOKEN") or 
-    os.getenv("TG_BOT_TOKEN") or 
-    os.getenv("BOT_TOKEN") or 
-    os.getenv("TG_TOKEN") or 
-    ""
-).strip()
-
-TELEGRAM_CHAT_ID = (
-    os.getenv("TELEGRAM_CHAT_ID") or 
-    os.getenv("TG_CHAT_ID") or 
-    os.getenv("CHAT_ID") or 
-    ""
-).strip()
+TELEGRAM_BOT_TOKEN = get_env_variable(["TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "BOT_TOKEN", "TG_TOKEN"])
+TELEGRAM_CHAT_ID = get_env_variable(["TELEGRAM_CHAT_ID", "TG_CHAT_ID", "CHAT_ID"])
 
 # 💰 15,000 元台幣本金風控配置
 TOTAL_EQUITY_TWD = 15000.0
@@ -55,7 +48,6 @@ DEFAULT_LEVERAGE = int(os.getenv("LEVERAGE", "10"))              # 槓桿 10x
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))         # 最多持倉 3 筆
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL", "20"))      # 輪詢間隔 20 秒
 
-# 排除大幣，專注小幣
 EXCLUDE_SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "USDC-USDT-SWAP"]
 
 # ==========================================
@@ -97,8 +89,11 @@ def http_request(url: str, method: str = "GET", headers: dict = None, body: str 
         with urllib.request.urlopen(req, timeout=10) as resp:
             content = resp.read().decode("utf-8")
             return json.loads(content)
+    except urllib.error.HTTPError as e:
+        err_content = e.read().decode("utf-8", errors="ignore")
+        return {"code": str(e.code), "msg": f"HTTP {e.code}: {err_content}"}
     except Exception as e:
-        return {"code": "-1", "msg": f"請求異常: {e}"}
+        return {"code": "-1", "msg": f"網路異常: {e}"}
 
 def get_okx_headers(method: str, request_path: str, body: str = "") -> dict:
     now = datetime.now(timezone.utc)
@@ -119,9 +114,7 @@ def get_okx_headers(method: str, request_path: str, body: str = "") -> dict:
     return headers
 
 def get_account_balance() -> tuple[float, float]:
-    """精準提取總資產與可用保證金 (完美對齊 OKX App 模擬盤)"""
     if not OKX_API_KEY:
-        print("⚠️ 未檢測到 OKX_API_KEY")
         return 0.0, 0.0
     try:
         path = "/api/v5/account/balance"
@@ -131,14 +124,11 @@ def get_account_balance() -> tuple[float, float]:
         
         if res.get("code") == "0" and res.get("data"):
             d = res["data"][0]
-            # 總資產估值 (即截圖中的 98,011.27 USD)
             total_eq = float(d.get("totalEq", "0.0"))
             avail_usdt = 0.0
             
-            # 遍歷幣種細節找尋 USDT
             for item in d.get("details", []):
                 if item.get("ccy") == "USDT":
-                    # 依序相容各種欄位名稱
                     val_str = (
                         item.get("availBal") or 
                         item.get("availEq") or 
@@ -151,7 +141,7 @@ def get_account_balance() -> tuple[float, float]:
             
             return total_eq, avail_usdt
         else:
-            print(f"⚠️ OKX 餘額查詢失敗: Code {res.get('code')}, Msg: {res.get('msg')}")
+            print(f"⚠️ OKX 餘額失敗: {res.get('msg')}")
     except Exception as e:
         print(f"⚠️ 餘額解析異常: {e}")
     return 0.0, 0.0
@@ -168,7 +158,7 @@ def get_open_positions() -> list:
             return [p for p in res["data"] if float(p.get("pos", "0")) != 0.0]
         else:
             if res.get("code") != "0":
-                print(f"⚠️ OKX 持倉查詢回傳: {res.get('msg')}")
+                print(f"⚠️ OKX 持倉回傳錯誤: {res.get('msg')}")
     except Exception as e:
         print(f"⚠️ 持倉解析異常: {e}")
     return []
@@ -206,7 +196,6 @@ def get_top_volatile_altcoins(limit: int = 30) -> list:
             "change": change_pct
         })
 
-    # 排序選出最活躍暴動小幣
     candidates.sort(key=lambda x: (x["change"] * 0.6 + (x["vol"] / 1e7) * 0.4), reverse=True)
     return [c["instId"] for c in candidates[:limit]]
 
@@ -250,7 +239,7 @@ def format_status_message() -> str:
 def telegram_listener():
     if not TELEGRAM_BOT_TOKEN:
         return
-    print("💬 Telegram 雙向對話監聽器已上線！")
+    print("💬 Telegram 雙向對話監聽器已在線！")
     last_update_id = 0
     while True:
         try:
@@ -472,10 +461,10 @@ def altcoin_trading_worker():
                 atr = ind["atr"]
 
                 signal = None
-                # 超跌反彈 (RSI 低 + 均線上行 + 爆量) 或極度超跌
+                # 超跌反彈
                 if (rsi <= 38.0 and ma_fast >= ma_slow and vol_surge >= 1.2) or (rsi <= 30.0):
                     signal = "LONG"
-                # 超買回調 (RSI 高 + 均線下行 + 爆量) 或極度超買
+                # 超買回調 (如 SATS 等)
                 elif (rsi >= 64.0 and ma_fast <= ma_slow and vol_surge >= 1.2) or (rsi >= 70.0):
                     signal = "SHORT"
 
@@ -504,11 +493,18 @@ def altcoin_trading_worker():
 def main():
     print("=" * 60)
     print("🚀 [OKX Quant Bot] 全市場小幣狙擊版啟動！")
-    print(f"💰 基準本金規格：{TOTAL_EQUITY_TWD:,.0f} TWD (單筆 {MARGIN_PER_TRADE_USDT} U / {DEFAULT_LEVERAGE}x 槓桿)")
-    print(f"🎯 交易環境：{'官方模擬盤 (x-simulated-trading: 1)' if IS_SIMULATED else '實盤交易'}")
+    
+    # 診斷金鑰載入狀態
+    key_diag = f"已載入 ({OKX_API_KEY[:4]}...)" if OKX_API_KEY else "❌ 未載入 (請檢查 Variables)"
+    sec_diag = "已載入" if OKX_API_SECRET else "❌ 未載入"
+    pass_diag = "已載入" if OKX_PASSPHRASE else "❌ 未載入"
+    print(f"🔑 OKX API KEY:    {key_diag}")
+    print(f"🔑 OKX SECRET:     {sec_diag}")
+    print(f"🔑 OKX PASSPHRASE: {pass_diag}")
+    print(f"🎯 交易模式:       {'官方模擬盤 (Demo)' if IS_SIMULATED else '實盤交易'}")
     print("=" * 60)
 
-    # 初次啟動印出一次帳戶資訊做驗證
+    # 連線測試
     total_eq, avail_usdt = get_account_balance()
     print(f"📊 [帳戶連線測試] 總淨值: {total_eq:,.2f} USD | 可用 USDT: {avail_usdt:,.2f}")
 
