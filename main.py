@@ -6,8 +6,6 @@ import base64
 import hashlib
 from datetime import datetime, timezone
 import requests
-import pandas as pd
-import numpy as np
 
 # ==============================================================================
 # 🔑 環境變數讀取 (Railway / 伺服器配置)
@@ -17,7 +15,7 @@ OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY", "")
 OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-IS_SIMULATED = os.getenv("IS_SIMULATED", "true").lower() == "true" # 模擬盤 or 實盤
+IS_SIMULATED = os.getenv("IS_SIMULATED", "true").lower() == "true"
 
 OKX_API_URL = "https://www.okx.com"
 
@@ -91,14 +89,24 @@ def fetch_candles(inst_id: str, bar="1H", limit=100):
         resp = requests.get(url, timeout=8).json()
         if resp.get("code") == "0":
             data = resp.get("data", [])
-            data.reverse()
+            data.reverse() # 時間從小到大
             return data
     except Exception:
         pass
     return []
 
 # ==============================================================================
-# 🧠 1:1 還原手機版量化決策引擎 (QuantEngineV2 & Macro Filters)
+# 🧮 純 Python 原生數學計算 (免 Pandas / 免 Numpy，保證不報錯)
+# ==============================================================================
+def calc_ema(values, span):
+    alpha = 2.0 / (span + 1.0)
+    ema = values[0]
+    for v in values[1:]:
+        ema = alpha * v + (1.0 - alpha) * ema
+    return ema
+
+# ==============================================================================
+# 🧠 1:1 還原手機版量化決策引擎
 # ==============================================================================
 def check_btc_macro():
     candles = fetch_candles("BTC-USDT-SWAP", "1H", 60)
@@ -109,12 +117,14 @@ def check_btc_macro():
     highs = [float(c[2]) for c in candles]
     lows = [float(c[3]) for c in candles]
     
-    # 計算 24H 波動率
-    volatility = (max(highs[-24:]) - min(lows[-24:])) / closes[-1]
+    # 24H 波動率
+    recent_high = max(highs[-24:])
+    recent_low = min(lows[-24:])
+    volatility = (recent_high - recent_low) / closes[-1]
     if volatility > BTC_MAX_VOLATILITY:
-        return False, "HIGH_VOLATILITY" # 大盤劇震，小幣全面避險
+        return False, "HIGH_VOLATILITY"
     
-    ema50 = pd.Series(closes).ewm(span=50).mean().iloc[-1]
+    ema50 = calc_ema(closes, 50)
     trend = "UP" if closes[-1] > ema50 else "DOWN"
     return True, trend
 
@@ -130,47 +140,45 @@ def analyze_symbol(inst_id: str, btc_trend: str):
     
     curr_price = closes[-1]
     
-    # 振幅檢查：避開死魚盤 (Amplitude >= 2.5%)
-    amplitude = (max(highs[-24:]) - min(lows[-24:])) / curr_price
+    # 振幅檢查：避開死魚盤
+    recent_high = max(highs[-24:])
+    recent_low = min(lows[-24:])
+    amplitude = (recent_high - recent_low) / curr_price
     if amplitude < MIN_AMPLITUDE:
         return None
     
-    # 指標運算
-    s_closes = pd.Series(closes)
-    ema20 = s_closes.ewm(span=20).mean().iloc[-1]
-    ema50 = s_closes.ewm(span=50).mean().iloc[-1]
+    ema20 = calc_ema(closes, 20)
+    ema50 = calc_ema(closes, 50)
     
-    # ATR (14) 自適應計算
+    # ATR (14) 計算
     tr_list = []
     for j in range(1, len(candles)):
         tr = max(highs[j] - lows[j], abs(highs[j] - closes[j-1]), abs(lows[j] - closes[j-1]))
         tr_list.append(tr)
-    atr = np.mean(tr_list[-14:])
+    recent_tr = tr_list[-14:]
+    atr = sum(recent_tr) / len(recent_tr) if recent_tr else (curr_price * 0.02)
     
     # 量能暴增
-    vol_avg = np.mean(vols[-20:-1])
+    prev_vols = vols[-20:-1]
+    vol_avg = sum(prev_vols) / len(prev_vols) if prev_vols else 1.0
     vol_surge = vols[-1] / max(vol_avg, 1e-6)
     
-    # 信心評分演算法 (手機版原裝)
     confidence = 70
     if vol_surge >= 1.8: confidence += 10
     if vol_surge >= 2.5: confidence += 5
     if amplitude >= 0.04: confidence += 5
     
     signal = None
-    # 順大趨勢做多
     if btc_trend == "UP" and ema20 > ema50 and vol_surge >= 1.8 and curr_price > closes[-2]:
         confidence += 5
         signal = "LONG"
-    # 順大趨勢做空
     elif btc_trend == "DOWN" and ema20 < ema50 and vol_surge >= 1.8 and curr_price < closes[-2]:
         confidence += 5
         signal = "SHORT"
         
     if signal and confidence >= MIN_CONFIDENCE_SCORE:
-        # 手機版 ATR 自適應止損與止盈
         sl_dist = atr * 1.5
-        tp_dist = atr * 3.2 # 1:2.1+ 優質盈虧比
+        tp_dist = atr * 3.2
         
         sl = curr_price - sl_dist if signal == "LONG" else curr_price + sl_dist
         tp = curr_price + tp_dist if signal == "LONG" else curr_price - tp_dist
@@ -189,11 +197,9 @@ def analyze_symbol(inst_id: str, btc_trend: str):
 # ==============================================================================
 # 🛡️ 實時持倉管理：保本 (BE Protect) + 波段鎖利 + 死魚盤超時
 # ==============================================================================
-# 追蹤每個持倉的運行狀態
 active_positions_tracker = {}
 
 def manage_open_positions():
-    # 取得真實持倉
     pos_res = okx_request("GET", "/api/v5/account/positions")
     if not pos_res or pos_res.get("code") != "0":
         return
@@ -203,30 +209,25 @@ def manage_open_positions():
     
     for pos in positions:
         inst_id = pos["instId"]
-        pos_side = pos["posSide"] # net or long/short
         pos_amt = float(pos.get("pos", 0))
         if pos_amt == 0:
             active_positions_tracker.pop(inst_id, None)
             continue
             
-        avg_px = float(pos.get("avgPx", 0))
-        upl = float(pos.get("upl", 0))
-        upl_ratio = float(pos.get("uplRatio", 0)) # ROI 例如 0.25 (25%)
+        upl_ratio = float(pos.get("uplRatio", 0)) # ROI
         
-        # 初始化追蹤器
         if inst_id not in active_positions_tracker:
             active_positions_tracker[inst_id] = {
                 "open_time": now_ts,
                 "peak_roi": upl_ratio,
-                "be_protected": False,
-                "trailing_active": False
+                "be_protected": False
             }
             
         tracker = active_positions_tracker[inst_id]
         if upl_ratio > tracker["peak_roi"]:
             tracker["peak_roi"] = upl_ratio
             
-        # 1. 浮盈 >= +20% ROI：啟動保本防護 (BE Protect)
+        # 1. 保本防護 (BE Protect)
         if not tracker["be_protected"] and upl_ratio >= BE_TRIGGER_ROI:
             tracker["be_protected"] = True
             send_telegram(
@@ -235,34 +236,31 @@ def manage_open_positions():
                 f"鎖定成本價出場，保證該筆零虧損！"
             )
 
-        # 2. 浮盈 >= +45% ROI：啟動波段移動鎖利 (Wave Trailing)
+        # 2. 波段移動鎖利 (Wave Trailing)
         if upl_ratio >= TRAILING_TRIGGER_ROI:
-            tracker["trailing_active"] = True
             floor_roi = tracker["peak_roi"] * TRAILING_PROFIT_FLOOR
             if upl_ratio <= floor_roi:
-                # 回撤打穿 70% 利潤地板，立刻市價全平鎖利！
                 send_telegram(
                     f"🏆 *【波段利潤大成收割】* `{inst_id}`\n"
                     f"歷史最高浮盈: `+{tracker['peak_roi']*100:.1f}%`\n"
                     f"回撤觸及利潤地板線 `+{floor_roi*100:.1f}%`，市價停利出場！"
                 )
-                close_market(inst_id, pos["side"] if "side" in pos else ("sell" if pos_amt > 0 else "buy"), pos_amt)
+                close_market(inst_id)
                 active_positions_tracker.pop(inst_id, None)
                 continue
 
-        # 3. 90 分鐘動能衰竭超時：若依然在微虧/保本附近，果斷出場換取流動性
+        # 3. 90 分鐘動能衰竭超時
         time_held = now_ts - tracker["open_time"]
         if time_held >= MOMENTUM_TIMEOUT_SEC and -0.05 <= upl_ratio <= 0.05:
             send_telegram(
                 f"⏱️ *【動能衰竭超時退場】* `{inst_id}`\n"
                 f"持倉超過 90 分鐘無動能（死魚盤），保本/微損撤出資金！"
             )
-            close_market(inst_id, pos["side"] if "side" in pos else ("sell" if pos_amt > 0 else "buy"), pos_amt)
+            close_market(inst_id)
             active_positions_tracker.pop(inst_id, None)
             continue
 
-def close_market(inst_id: str, side: str, sz: float):
-    # OKX 市價全平
+def close_market(inst_id: str):
     body = {
         "instId": inst_id,
         "mgnMode": "cross"
@@ -273,20 +271,17 @@ def close_market(inst_id: str, side: str, sz: float):
 # 🚀 主循環排程
 # ==============================================================================
 def run_loop():
-    send_telegram("🤖 *OKX 手機版原版移植量化核心已在新平台啟動！*")
+    send_telegram("🤖 *OKX 手機版原版移植量化核心已在 Railway 正常啟動！*")
     while True:
         try:
-            # 1. 管理既有持倉 (保本 + 波段鎖利)
             manage_open_positions()
             
-            # 2. 檢查大盤 BTC
             btc_ok, btc_trend = check_btc_macro()
             if not btc_ok:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] BTC 劇震避險中，暫停開倉...")
                 time.sleep(60)
                 continue
                 
-            # 3. 掃描小幣候選者
             for symbol in MONITOR_SYMBOLS:
                 res = analyze_symbol(symbol, btc_trend)
                 if res:
@@ -296,13 +291,12 @@ def run_loop():
                         f"現價: `{res['price']}`\n"
                         f"自適應止損: `{res['sl']:.4f}` | 止盈: `{res['tp']:.4f}`"
                     )
-                    # 下單邏輯 (依您實際需求調用下單 API)
                     time.sleep(2)
                     
         except Exception as e:
             print(f"Loop Error: {e}")
             
-        time.sleep(30) # 每 30 秒心跳一次
+        time.sleep(30)
 
 if __name__ == "__main__":
     run_loop()
